@@ -73,5 +73,5 @@ if __name__ == "__main__":
 
     print("\n--- Model download process finished. ---")
     print("Please also ensure you have the Ollama model available.")
-    print("You can get it by running: ollama pull gemma:3b")
+    print("You can get it by running: ollama pull gemma3:1b")
     print("------------------------------------------")

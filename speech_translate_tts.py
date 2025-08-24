@@ -88,7 +88,7 @@ DEFAULT_WHISPER_MODEL_ID = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
 DEFAULT_TTS_MODEL_ID = "coqui/XTTS-v2"
 DEFAULT_WHISPER_PATH = f"models--{DEFAULT_WHISPER_MODEL_ID.replace('/', '--')}"
 DEFAULT_TTS_PATH = "tts_models--multilingual--multi-dataset--xtts_v2"
-DEFAULT_OLLAMA_MODEL = "gemma:3b"
+DEFAULT_OLLAMA_MODEL = "gemma3:1b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
 # Audio streaming settings
@@ -286,10 +286,16 @@ class ASRWorker(threading.Thread):
         audio_queue = queue.Queue()
 
         def audio_callback(indata, frames, time, status):
-            if self.tts_event.is_set(): return
-            if status: self.status_queue.put(f"Audio Warning: {status}")
-            mono_data = np.mean(indata, axis=1) if indata.ndim > 1 else indata
-            audio_queue.put(mono_data.tobytes())
+            if self.tts_event.is_set():
+                return  # Discard audio data if TTS is playing
+            if status:
+                self.status_queue.put(f"Audio Warning: {status}")
+
+            # For webrtcvad, we need raw int16 bytes.
+            # Taking the first channel is the most direct way to get mono
+            # without changing the data type from int16.
+            mono_data_int16 = indata[:, 0] if indata.ndim > 1 else indata
+            audio_queue.put(mono_data_int16.tobytes())
 
         stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=input_channels, dtype='int16',
