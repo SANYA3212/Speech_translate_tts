@@ -19,6 +19,3 @@ llvmlite==0.43.0
 sounddevice==0.5.2
 soundfile==0.13.1
 requests==2.32.3
-tk
-# Note: 'tk' is usually part of the standard library, but explicit listing can help some venv tools.
-# If pip fails on 'tk', remove this line. It should work without it.

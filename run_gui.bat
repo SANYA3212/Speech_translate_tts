@@ -7,10 +7,11 @@ echo #############################################################
 
 set VENV_DIR=venv311
 set SCRIPT_NAME=speech_translate_tts.py
+set PYTHON_EXE="%VENV_DIR%\Scripts\python.exe"
 
-REM Check if venv exists
-if not exist "%VENV_DIR%\Scripts\activate.bat" (
-    echo Error: Virtual environment not found at .\%VENV_DIR%
+REM Check if venv's python executable exists
+if not exist %PYTHON_EXE% (
+    echo Error: Python executable not found at %PYTHON_EXE%
     echo Please run setup.bat first to create the environment and install dependencies.
     pause
     exit /b 1
@@ -27,12 +28,9 @@ REM Activate venv and run the script
 echo Activating virtual environment...
 call "%VENV_DIR%\Scripts\activate.bat"
 
-echo Starting the Python GUI script...
-echo --- Script Output ---
-
-REM Use -X utf8 to force UTF-8 mode, critical for handling different languages.
-REM Use -B to prevent Python from writing .pyc files.
-python -X utf8 -B %SCRIPT_NAME%
+echo.
+echo --- Starting the Python GUI script with explicit interpreter path... ---
+%PYTHON_EXE% -X utf8 -B %SCRIPT_NAME%
 
 echo.
 echo --- Script Finished ---

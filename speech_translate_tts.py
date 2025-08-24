@@ -9,6 +9,21 @@ import os
 import sys
 import platform
 
+# --- START: Desperate fix for stubborn ModuleNotFoundError ---
+# This block manually adds the venv's site-packages to the path.
+# This should not be necessary, but it's a fallback for broken environments.
+try:
+    # Assuming standard venv structure: <venv_root>/Scripts/python.exe
+    venv_scripts_dir = os.path.dirname(sys.executable)
+    site_packages = os.path.join(venv_scripts_dir, '..', 'Lib', 'site-packages')
+    site_packages = os.path.normpath(site_packages)
+    if os.path.exists(site_packages) and site_packages not in sys.path:
+        sys.path.insert(0, site_packages)
+        print(f"DEBUG: Manually added '{site_packages}' to sys.path to fix import errors.")
+except Exception as e:
+    print(f"DEBUG: Could not manually add site-packages. Error: {e}")
+# --- END: Desperate fix ---
+
 # Add torch/lib to PATH on Windows to help find DLLs like cuDNN
 if platform.system() == 'Windows':
     try:
