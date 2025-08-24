@@ -19,9 +19,9 @@ This project is an offline-first, real-time speech translation GUI for Windows. 
 ## Tech Stack
 
 -   **GUI:** Python + Tkinter
--   **ASR (Speech-to-Text):** `faster-whisper`
+-   **ASR (Speech-to-Text):** [`faster-whisper` (large-v3-turbo)](https://huggingface.co/mobiuslabsgmbh/faster-whisper-large-v3-turbo)
 -   **Translation LLM:** `Ollama`
--   **TTS (Text-to-Speech):** `Coqui TTS`
+-   **TTS (Text-to-Speech):** [`Coqui XTTS-v2`](https://huggingface.co/coqui/XTTS-v2)
 -   **Audio I/O:** `sounddevice`
 
 ---
