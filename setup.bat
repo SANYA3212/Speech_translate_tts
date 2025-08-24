@@ -21,24 +21,28 @@ if %errorlevel% neq 0 (
 
 echo Found Python %PYTHON_VERSION% via 'py' launcher.
 
+REM Force-delete existing venv directory to ensure a clean slate
+if exist "%VENV_DIR%" (
+    echo Deleting existing virtual environment directory to ensure a clean setup...
+    rd /s /q "%VENV_DIR%"
+)
+
 REM Create virtual environment
-if not exist "%VENV_DIR%" (
-    echo Creating virtual environment in .\%VENV_DIR%...
-    %PYTHON_LAUNCHER% -m venv %VENV_DIR%
-    if %errorlevel% neq 0 (
-        echo Failed to create virtual environment.
-        pause
-        exit /b 1
-    )
-) else (
-    echo Virtual environment .\%VENV_DIR% already exists.
+echo Creating virtual environment in .\%VENV_DIR%...
+%PYTHON_LAUNCHER% -m venv %VENV_DIR%
+if %errorlevel% neq 0 (
+    echo Failed to create virtual environment.
+    pause
+    exit /b 1
 )
 
 REM Activate virtual environment and install dependencies
 echo Activating virtual environment and installing dependencies from requirements.txt...
 call "%VENV_DIR%\Scripts\activate.bat"
 
-pip install -r requirements.txt
+echo.
+echo --- Ensuring pip is run by the correct Python interpreter from venv... ---
+python -m pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo ####################################################################
     echo # ERROR: Failed to install dependencies.                           #
@@ -54,7 +58,7 @@ echo #############################################################
 echo # Dependencies installed. Now downloading models...         #
 echo #############################################################
 
-REM Run the model downloader script
+REM Run the model downloader script using the venv's python
 python download_models.py
 if %errorlevel% neq 0 (
     echo ####################################################################
