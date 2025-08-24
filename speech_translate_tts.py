@@ -62,10 +62,12 @@ except ImportError:
 
 # --- Configuration ---
 APP_TITLE = "Real-Time Speech Translator"
-OFFLINE_ONLY = False  # Set to True to disable all downloads
-DEFAULT_WHISPER_MODEL = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
-DEFAULT_TTS_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
-DEFAULT_OLLAMA_MODEL = "gemma:2b" # Changed to gemma:2b as a more common default
+OFFLINE_ONLY = True  # Models should be downloaded by setup.bat
+DEFAULT_WHISPER_MODEL_ID = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+DEFAULT_TTS_MODEL_ID = "coqui/XTTS-v2"
+DEFAULT_WHISPER_PATH = f"models--{DEFAULT_WHISPER_MODEL_ID.replace('/', '--')}"
+DEFAULT_TTS_PATH = "tts_models--multilingual--multi-dataset--xtts_v2"
+DEFAULT_OLLAMA_MODEL = "gemma:2b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
 # Audio streaming settings
@@ -79,47 +81,19 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 # --- Helper Functions ---
-def find_model_path(model_id, model_type):
+def find_model_path(local_path, repo_id):
     """
-    Finds a model path locally, searching in project root and huggingface cache structure.
-    model_type: 'whisper' or 'tts'
+    Checks if a model exists at the standardized local path.
+    Returns the local path if found, otherwise returns the repo_id.
     """
-    base_name = model_id.replace('/', '--')
-    search_paths = [
-        Path(f"./models/{base_name}"),
-        Path(f"./{base_name}"),
-        Path(os.environ['HF_HOME']) / "hub" / f"models--{base_name}",
-    ]
-    if model_type == 'tts': # TTS has a different default path
-        search_paths.insert(0, Path(f"./{model_id}"))
+    path = Path(local_path)
+    if path.exists() and (path / "config.json").exists():
+        logging.info(f"Found model at standardized path: {path}")
+        return str(path)
 
-    for path in search_paths:
-        if not path.exists():
-            continue
-
-        # Direct match
-        if (path / "config.json").exists():
-            if model_type == 'whisper' and ((path / "model.bin").exists() or list(path.glob("model-*.bin"))):
-                logging.info(f"Found Whisper model at: {path}")
-                return str(path)
-            if model_type == 'tts' and ((path / "model.pth").exists() or (path / "model.safetensors").exists()):
-                logging.info(f"Found TTS model at: {path}")
-                return str(path)
-
-        # Snapshot subdirectory match (common with huggingface-hub)
-        snapshot_dir = path / "snapshots"
-        if snapshot_dir.exists():
-            for subdir in sorted(snapshot_dir.iterdir(), reverse=True): # Get latest snapshot
-                if subdir.is_dir() and (subdir / "config.json").exists():
-                    if model_type == 'whisper' and ((subdir / "model.bin").exists() or list(subdir.glob("model-*.bin"))):
-                        logging.info(f"Found Whisper model in snapshot: {subdir}")
-                        return str(subdir)
-                    if model_type == 'tts' and ((subdir / "model.pth").exists() or (subdir / "model.safetensors").exists()):
-                        logging.info(f"Found TTS model in snapshot: {subdir}")
-                        return str(subdir)
-
-    logging.warning(f"{model_type.upper()} model '{model_id}' not found in local paths.")
-    return model_id # Return original ID for online download if OFFLINE_ONLY is False
+    logging.warning(f"Model not found at '{local_path}'. Falling back to repo ID '{repo_id}'.")
+    # This will only work if the user manually sets OFFLINE_ONLY=False
+    return repo_id
 
 def check_ollama_status(model_name):
     """Checks if Ollama is running and has the specified model."""
@@ -554,22 +528,23 @@ class SpeechTranslatorApp:
         try:
             if model_type == 'whisper':
                 self.update_status("Finding Whisper model...")
-                model_path = find_model_path(DEFAULT_WHISPER_MODEL, 'whisper')
+                model_path = find_model_path(DEFAULT_WHISPER_PATH, DEFAULT_WHISPER_MODEL_ID)
 
                 self.update_status(f"Loading Whisper from '{model_path}'...")
                 global whisper_model
-                whisper_model = WhisperModel(model_path, device="cuda", compute_type="int8_float16")
+                whisper_model = WhisperModel(model_path, device="cuda", compute_type="int8_float16", download_root=DEFAULT_WHISPER_PATH)
 
                 self.root.after(0, lambda: self.whisper_status.config(text="Whisper: Loaded OK"))
                 self.update_status("Whisper model loaded successfully.")
 
             elif model_type == 'tts':
                 self.update_status("Finding XTTS model...")
-                model_path = find_model_path(DEFAULT_TTS_MODEL, 'tts')
+                # For TTS, the model path and config path are often the same directory
+                model_path = find_model_path(DEFAULT_TTS_PATH, DEFAULT_TTS_MODEL_ID)
 
                 self.update_status(f"Loading XTTS from '{model_path}'...")
                 global tts_model
-                tts_model = TTS(model_path=model_path, config_path=os.path.join(model_path, 'config.json')).to("cuda")
+                tts_model = TTS(model_path=model_path, config_path=os.path.join(model_path, 'config.json'), progress_bar=True).to("cuda")
 
                 self.root.after(0, lambda: self.xtts_status.config(text="XTTS: Loaded OK"))
                 self.update_status("XTTS model loaded successfully. Starting TTS worker...")
@@ -579,7 +554,7 @@ class SpeechTranslatorApp:
                     self.tts_worker.start()
 
         except Exception as e:
-            error_msg = f"Failed to load {model_type} model: {e}"
+            error_msg = f"Failed to load {model_type} model. Please ensure it was downloaded correctly with setup.bat. Error: {e}"
             self.update_status(error_msg)
             logging.error(error_msg, exc_info=True)
             messagebox.showerror("Model Loading Error", error_msg)
@@ -675,16 +650,11 @@ if __name__ == "__main__":
 
     is_ollama_up, ollama_msg = check_ollama_status(DEFAULT_OLLAMA_MODEL)
     if not is_ollama_up:
-        messagebox.showerror("Ollama Error", ollama_msg)
-        sys.exit(1)
+        messagebox.showwarning("Ollama Warning", f"{ollama_msg}. Translation will be disabled.")
+    else:
+        logging.info(ollama_msg)
 
-    # Create main window
+    # Create and run main window
     root = tk.Tk()
     app = SpeechTranslatorApp(root)
-
-    # Check if Ollama model needs pulling
-    if "not found" in ollama_msg:
-        if messagebox.askyesno("Ollama", f"The model '{app.ollama_model_var.get()}' was not found in Ollama. Do you want to pull it now?"):
-            threading.Thread(target=pull_ollama_model, args=(app.ollama_model_var.get(), app), daemon=True).start()
-
     root.mainloop()

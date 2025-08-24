@@ -2,43 +2,29 @@
 setlocal
 
 echo #############################################################
-echo # Setting up virtual environment for Speech Translator... #
+echo # Setting up virtual environment and downloading models...  #
 echo #############################################################
 
 set PYTHON_VERSION=3.11
 set VENV_DIR=venv311
+set PYTHON_LAUNCHER=py -%PYTHON_VERSION%
 
-REM Find Python 3.11
-echo Searching for Python %PYTHON_VERSION%...
-where python%PYTHON_VERSION%.exe >nul 2>nul
-if %errorlevel% == 0 (
-    set PYTHON_EXE=python%PYTHON_VERSION%.exe
-    goto found_python
+REM Check for Python 3.11 via the Python Launcher
+%PYTHON_LAUNCHER% -c "import sys; sys.exit(0)" >nul 2>nul
+if %errorlevel% neq 0 (
+    echo Error: Python %PYTHON_VERSION% not found.
+    echo Please install Python %PYTHON_VERSION% for Windows and ensure the 'py' launcher is in your PATH.
+    echo You can get it from python.org.
+    pause
+    exit /b 1
 )
 
-where python.exe >nul 2>nul
-if %errorlevel% == 0 (
-    for /f "tokens=*" %%i in ('python.exe --version') do set "PY_VERSION_OUTPUT=%%i"
-    echo Found python.exe, checking version: %PY_VERSION_OUTPUT%
-    echo %PY_VERSION_OUTPUT% | find "Python %PYTHON_VERSION%" >nul
-    if %errorlevel% == 0 (
-        set PYTHON_EXE=python.exe
-        goto found_python
-    )
-)
-
-echo Error: Python %PYTHON_VERSION% not found in PATH.
-echo Please install Python %PYTHON_VERSION% and ensure it's added to your PATH.
-pause
-exit /b 1
-
-:found_python
-echo Found Python executable: %PYTHON_EXE%
+echo Found Python %PYTHON_VERSION% via 'py' launcher.
 
 REM Create virtual environment
 if not exist "%VENV_DIR%" (
     echo Creating virtual environment in .\%VENV_DIR%...
-    %PYTHON_EXE% -m venv %VENV_DIR%
+    %PYTHON_LAUNCHER% -m venv %VENV_DIR%
     if %errorlevel% neq 0 (
         echo Failed to create virtual environment.
         pause
@@ -57,7 +43,6 @@ if %errorlevel% neq 0 (
     echo ####################################################################
     echo # ERROR: Failed to install dependencies.                           #
     echo # Please check the error messages above.                           #
-    echo # Ensure you have CUDA 12.1 compatible drivers installed.          #
     echo # The console will remain open for inspection.                     #
     echo ####################################################################
     pause
@@ -66,7 +51,24 @@ if %errorlevel% neq 0 (
 
 echo.
 echo #############################################################
-echo # Setup complete!                                         #
+echo # Dependencies installed. Now downloading models...         #
+echo #############################################################
+
+REM Run the model downloader script
+python download_models.py
+if %errorlevel% neq 0 (
+    echo ####################################################################
+    echo # ERROR: Failed to download models.                                #
+    echo # Please check the error messages above.                           #
+    echo # The console will remain open for inspection.                     #
+    echo ####################################################################
+    pause
+    exit /b 1
+)
+
+echo.
+echo #############################################################
+echo # Setup complete! Models and dependencies are ready.        #
 echo # You can now run the application using run_gui.bat       #
 echo #############################################################
 echo.
