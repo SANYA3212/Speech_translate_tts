@@ -1,0 +1,24 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchaudio==2.5.1+cu121
+# ASR Dependencies
+faster-whisper==1.2.0
+ctranslate2==4.6.0
+av==12.3.0
+onnxruntime==1.18.1
+# HF Stack and TTS Dependencies
+tokenizers==0.21.0
+transformers==4.49.0
+huggingface-hub>=0.26,<1.0
+TTS==0.22.0
+# Coqui TTS Compatibility Pins
+numpy==1.26.4
+numba==0.60.0
+llvmlite==0.43.0
+# Other Utilities
+sounddevice==0.5.2
+soundfile==0.13.1
+requests==2.32.3
+tk
+# Note: 'tk' is usually part of the standard library, but explicit listing can help some venv tools.
+# If pip fails on 'tk', remove this line. It should work without it.
