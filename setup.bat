@@ -42,7 +42,8 @@ call "%VENV_DIR%\Scripts\activate.bat"
 
 echo.
 echo --- Ensuring pip is run by the correct Python interpreter from venv... ---
-python -m pip install -r requirements.txt
+echo --- Forcing re-download of all packages to avoid cache issues... ---
+python -m pip install --no-cache-dir -r requirements.txt
 if %errorlevel% neq 0 (
     echo ####################################################################
     echo # ERROR: Failed to install dependencies.                           #

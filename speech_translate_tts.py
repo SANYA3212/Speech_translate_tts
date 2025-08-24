@@ -63,6 +63,12 @@ except ImportError as e:
     sys.exit(1)
 
 try:
+    import simpleaudio as sa
+except ImportError:
+    messagebox.showerror("Dependency Error", "Module 'simpleaudio' not found. Please run setup.bat.")
+    sys.exit(1)
+
+try:
     from faster_whisper import WhisperModel
 except ImportError:
     messagebox.showerror("Dependency Error", "Module 'faster_whisper' not found. Please run setup.bat.")
@@ -82,7 +88,7 @@ DEFAULT_WHISPER_MODEL_ID = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
 DEFAULT_TTS_MODEL_ID = "coqui/XTTS-v2"
 DEFAULT_WHISPER_PATH = f"models--{DEFAULT_WHISPER_MODEL_ID.replace('/', '--')}"
 DEFAULT_TTS_PATH = "tts_models--multilingual--multi-dataset--xtts_v2"
-DEFAULT_OLLAMA_MODEL = "gemma:2b"
+DEFAULT_OLLAMA_MODEL = "gemma:3b"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
 # Audio streaming settings
@@ -92,7 +98,18 @@ STREAM_STEP_S = 0.75 # Process audio every 0.75 seconds
 BUFFER_SIZE_SAMPLES = int(STREAM_WINDOW_S * SAMPLE_RATE)
 
 # Logging setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+log_file = log_dir / "app.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
 
 # --- Helper Functions ---
@@ -169,70 +186,54 @@ def longest_common_prefix(s1, s2):
 
 # --- Worker Threads ---
 
+# --- VAD Imports ---
+try:
+    import webrtcvad
+except ImportError:
+    messagebox.showerror("Dependency Error", "Module 'webrtcvad-wheels' not found. Please run setup.bat.")
+    sys.exit(1)
+
 class ASRWorker(threading.Thread):
-    def __init__(self, mode, input_device_idx, vad, result_queue, status_queue):
+    def __init__(self, mode, input_device_idx, vad_aggressiveness, result_queue, status_queue, tts_event):
         super().__init__(daemon=True)
-        self.mode = mode # 'single_shot' or 'streaming'
+        self.mode = mode
         self.input_device_idx = input_device_idx
-        self.vad = vad
         self.result_queue = result_queue
         self.status_queue = status_queue
+        self.tts_event = tts_event
         self.stop_event = threading.Event()
-        self.audio_buffer = collections.deque(maxlen=BUFFER_SIZE_SAMPLES)
-        self.full_transcript = ""
-        self.last_stable_transcript = ""
+
+        # VAD and streaming state
+        self.vad = webrtcvad.Vad(vad_aggressiveness)
+        self.is_speaking = False
+        self.speech_buffer = []
+        self.silence_start_time = None
+        self.silence_timeout_s = 1.0  # 1 second of silence to trigger transcription
+        self.vad_chunk_size = 480 # 30ms at 16kHz, required by webrtcvad
 
     def stop(self):
         self.stop_event.set()
 
     def _process_transcription(self, model, audio_data):
         try:
+            # The VAD for transcription is the whisper one, not webrtcvad
             segments, info = model.transcribe(
                 audio_data,
                 beam_size=5,
-                vad_filter=self.vad,
+                vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
-                language=None # Auto-detect
+                language=None
             )
-
-            if self.mode == 'streaming':
-                current_transcript = "".join(seg.text for seg in segments).strip()
-
-                if not self.last_stable_transcript:
-                    # First run
-                    self.last_stable_transcript = current_transcript
-                    newly_confirmed = current_transcript
-                else:
-                    # Find stable prefix
-                    stable_prefix = longest_common_prefix(self.last_stable_transcript, current_transcript)
-                    newly_confirmed = self.last_stable_transcript[len(stable_prefix):]
-                    self.last_stable_transcript = stable_prefix
-
-                live_text = current_transcript[len(self.last_stable_transcript):]
-
-                if newly_confirmed:
-                    self.full_transcript += newly_confirmed
-
-                self.result_queue.put({
-                    "type": "asr_result",
-                    "confirmed_text": newly_confirmed,
-                    "live_text": live_text,
-                    "source_lang": info.language
-                })
-
-            else: # single_shot
-                full_text = "".join(seg.text for seg in segments).strip()
-                self.result_queue.put({
-                    "type": "asr_result",
-                    "confirmed_text": full_text,
-                    "live_text": "",
-                    "source_lang": info.language
-                })
-
+            full_text = "".join(seg.text for seg in segments).strip()
+            self.result_queue.put({
+                "type": "asr_result",
+                "confirmed_text": full_text,
+                "live_text": "", # No live text in this new logic
+                "source_lang": info.language
+            })
         except Exception as e:
             self.status_queue.put(f"ASR Error: {e}")
             logging.error(f"Exception in ASR transcription: {e}", exc_info=True)
-
 
     def run(self):
         global whisper_model
@@ -243,43 +244,14 @@ class ASRWorker(threading.Thread):
         self.status_queue.put(f"Starting {self.mode} recording...")
 
         try:
+            device_info = sd.query_devices(self.input_device_idx, 'input')
+            input_channels = device_info.get('max_input_channels', 1)
+            logging.info(f"Opening input device {device_info['name']} with {input_channels} channel(s).")
+
             if self.mode == 'streaming':
-                self.audio_buffer.clear()
-                self.full_transcript = ""
-                self.last_stable_transcript = ""
-
-                def audio_callback(indata, frames, time, status):
-                    if status:
-                        self.status_queue.put(f"Audio Warning: {status}")
-                    self.audio_buffer.extend(indata[:, 0])
-
-                with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
-                                    device=self.input_device_idx, callback=audio_callback):
-                    while not self.stop_event.is_set():
-                        time.sleep(STREAM_STEP_S)
-                        if len(self.audio_buffer) > 0:
-                            audio_data = np.array(self.audio_buffer)
-                            self._process_transcription(whisper_model, audio_data)
-
+                self.run_streaming_mode(input_channels)
             else: # single_shot
-                recorded_audio = []
-                def audio_callback(indata, frames, time, status):
-                    if status:
-                        self.status_queue.put(f"Audio Warning: {status}")
-                    recorded_audio.append(indata.copy())
-
-                with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
-                                    device=self.input_device_idx, callback=audio_callback):
-                    while not self.stop_event.is_set():
-                        sd.sleep(100)
-
-                if recorded_audio:
-                    audio_data = np.concatenate(recorded_audio, axis=0).flatten()
-                    # Normalize audio if clipping
-                    if np.max(np.abs(audio_data)) > 1.0:
-                        audio_data = audio_data / np.max(np.abs(audio_data))
-                    self.status_queue.put("Transcription started...")
-                    self._process_transcription(whisper_model, audio_data)
+                self.run_single_shot_mode(input_channels)
 
         except Exception as e:
             error_msg = f"Audio stream error: {e}"
@@ -289,13 +261,84 @@ class ASRWorker(threading.Thread):
 
         self.status_queue.put("Recording stopped.")
 
+    def run_single_shot_mode(self, input_channels):
+        recorded_audio = []
+        def audio_callback(indata, frames, time, status):
+            if self.tts_event.is_set(): return
+            if status: self.status_queue.put(f"Audio Warning: {status}")
+            mono_data = np.mean(indata, axis=1) if indata.ndim > 1 else indata
+            recorded_audio.append(mono_data)
+
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=input_channels, dtype='float32',
+                            device=self.input_device_idx, callback=audio_callback):
+            while not self.stop_event.is_set():
+                sd.sleep(100)
+
+        if recorded_audio:
+            audio_data = np.concatenate(recorded_audio, axis=0).flatten()
+            if np.max(np.abs(audio_data)) > 1.0:
+                audio_data = audio_data / np.max(np.abs(audio_data))
+            self.status_queue.put("Transcription started...")
+            self._process_transcription(whisper_model, audio_data)
+
+    def run_streaming_mode(self, input_channels):
+        """New streaming logic based on VAD endpointing."""
+        audio_queue = queue.Queue()
+
+        def audio_callback(indata, frames, time, status):
+            if self.tts_event.is_set(): return
+            if status: self.status_queue.put(f"Audio Warning: {status}")
+            mono_data = np.mean(indata, axis=1) if indata.ndim > 1 else indata
+            audio_queue.put(mono_data.tobytes())
+
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=input_channels, dtype='int16',
+            device=self.input_device_idx, blocksize=self.vad_chunk_size,
+            callback=audio_callback
+        )
+        with stream:
+            while not self.stop_event.is_set():
+                chunk = audio_queue.get()
+                if not chunk: continue
+
+                is_speech = self.vad.is_speech(chunk, SAMPLE_RATE)
+
+                if self.is_speaking:
+                    self.speech_buffer.append(chunk)
+                    if not is_speech:
+                        if self.silence_start_time is None:
+                            self.silence_start_time = time.monotonic()
+
+                        if time.monotonic() - self.silence_start_time > self.silence_timeout_s:
+                            logging.info(f"Detected end of speech after {self.silence_timeout_s}s of silence.")
+                            full_audio_bytes = b"".join(self.speech_buffer)
+                            audio_np = np.frombuffer(full_audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+                            self.status_queue.put("Transcription started...")
+                            # Run transcription in a separate thread to not block the VAD loop
+                            threading.Thread(target=self._process_transcription, args=(whisper_model, audio_np)).start()
+
+                            self.speech_buffer = []
+                            self.is_speaking = False
+                            self.silence_start_time = None
+                    else:
+                        # Reset silence timer if speech continues
+                        self.silence_start_time = None
+
+                elif is_speech:
+                    logging.info("Speech detected, starting to record utterance.")
+                    self.is_speaking = True
+                    self.speech_buffer.append(chunk)
+
+
 
 class TTSWorker(threading.Thread):
-    def __init__(self, task_queue, status_queue, output_device_idx):
+    def __init__(self, task_queue, status_queue, tts_event):
         super().__init__(daemon=True)
         self.task_queue = task_queue
         self.status_queue = status_queue
-        self.output_device_idx = output_device_idx
+        self.tts_event = tts_event
+        self.temp_audio_file = Path("_temp_tts.wav")
 
     def run(self):
         global tts_model
@@ -312,19 +355,46 @@ class TTSWorker(threading.Thread):
                     continue
 
                 self.status_queue.put(f"Synthesizing speech for: '{text[:30]}...'")
+                logging.info(f"Starting TTS synthesis for text: '{text}'")
 
-                # Check if output device is valid before synthesis
+                # Synthesize audio
+                tts_args = {
+                    "text": text,
+                    "language": lang,
+                    "split_sentences": True,
+                }
+                if speaker_wav and Path(speaker_wav).exists():
+                    tts_args["speaker_wav"] = speaker_wav
+                else:
+                    # If no speaker wav is provided, use the first available default speaker
+                    if tts_model.speakers:
+                        tts_args["speaker"] = tts_model.speakers[0]
+                        logging.info(f"No speaker_wav provided, using default speaker: {tts_args['speaker']}")
+                    else:
+                        logging.error("No speaker_wav provided and no default speakers available in the model.")
+                        self.task_queue.task_done()
+                        continue
+
+                wav = tts_model.tts(**tts_args)
+
+                # Write to a temporary WAV file
+                sf.write(
+                    self.temp_audio_file,
+                    np.array(wav),
+                    tts_model.synthesizer.output_sample_rate
+                )
+                logging.info(f"TTS audio saved to temporary file: {self.temp_audio_file}")
+
+                # Play audio using simpleaudio from the temporary file
                 try:
-                    sd.check_output_settings(device=self.output_device_idx, samplerate=24000) # XTTS default rate
-                except Exception as e:
-                    self.status_queue.put(f"TTS Error: Invalid output device. {e}")
-                    continue
-
-                wav = tts_model.tts(text=text, language=lang, speaker_wav=speaker_wav, split_sentences=True)
-
-                # Play audio using sounddevice
-                sd.play(np.array(wav), samplerate=tts_model.synthesizer.output_sample_rate, device=self.output_device_idx)
-                sd.wait()
+                    self.tts_event.set()
+                    logging.info("Playback started, ASR is paused.")
+                    wave_obj = sa.WaveObject.from_wave_file(str(self.temp_audio_file))
+                    play_obj = wave_obj.play()
+                    play_obj.wait_done()
+                finally:
+                    self.tts_event.clear()
+                    logging.info("Playback finished, ASR can resume.")
 
                 self.status_queue.put("Speech synthesis finished.")
                 self.task_queue.task_done()
@@ -332,7 +402,7 @@ class TTSWorker(threading.Thread):
             except queue.Empty:
                 continue
             except Exception as e:
-                error_msg = f"TTS synthesis failed: {e}"
+                error_msg = f"TTS synthesis or playback failed: {e}"
                 self.status_queue.put(error_msg)
                 logging.error(error_msg, exc_info=True)
                 self.task_queue.task_done()
@@ -357,6 +427,7 @@ class SpeechTranslatorApp:
         self.tts_worker = None
         self.is_recording = False
         self.is_streaming = False
+        self.tts_is_playing = threading.Event() # Event to signal TTS playback
 
         # Queues for thread communication
         self.result_queue = queue.Queue()
@@ -369,7 +440,7 @@ class SpeechTranslatorApp:
         self.ollama_model_var = tk.StringVar(value=DEFAULT_OLLAMA_MODEL)
         self.mic_var = tk.StringVar()
         self.speaker_var = tk.StringVar()
-        self.vad_var = tk.BooleanVar(value=True)
+        self.vad_aggressiveness_var = tk.IntVar(value=1)
         self.auto_speak_var = tk.BooleanVar(value=True)
         self.auto_save_var = tk.BooleanVar(value=False)
         self.speaker_wav_var = tk.StringVar()
@@ -436,15 +507,19 @@ class SpeechTranslatorApp:
 
         options_frame = ttk.LabelFrame(main_frame, text="Options", padding="10")
         options_frame.grid(row=2, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        options_frame.columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(options_frame, text="VAD (Voice Activity Detection)", variable=self.vad_var).pack(anchor=tk.W)
-        ttk.Checkbutton(options_frame, text="Auto-speak Translation", variable=self.auto_speak_var).pack(anchor=tk.W)
-        ttk.Checkbutton(options_frame, text="Auto-save Transcript", variable=self.auto_save_var).pack(anchor=tk.W)
+        ttk.Checkbutton(options_frame, text="Auto-speak Translation", variable=self.auto_speak_var).grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        ttk.Checkbutton(options_frame, text="Auto-save Transcript", variable=self.auto_save_var).grid(row=1, column=0, columnspan=2, sticky=tk.W)
+
+        ttk.Label(options_frame, text="VAD Aggressiveness:").grid(row=2, column=0, sticky=tk.W, pady=(5,0))
+        ttk.Combobox(options_frame, textvariable=self.vad_aggressiveness_var, values=[0, 1, 2, 3], width=5, state="readonly").grid(row=2, column=1, sticky=tk.W, pady=(5,0))
 
         speaker_wav_frame = ttk.Frame(options_frame)
-        speaker_wav_frame.pack(fill=tk.X, pady=5)
-        ttk.Button(speaker_wav_frame, text="Speaker WAV...", command=self.select_speaker_wav).pack(side=tk.LEFT)
-        ttk.Entry(speaker_wav_frame, textvariable=self.speaker_wav_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        speaker_wav_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        speaker_wav_frame.columnconfigure(1, weight=1)
+        ttk.Button(speaker_wav_frame, text="Speaker WAV...", command=self.select_speaker_wav).grid(row=0, column=0)
+        ttk.Entry(speaker_wav_frame, textvariable=self.speaker_wav_var, state="readonly").grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
 
         # --- Text Widgets ---
         text_frame = ttk.Frame(main_frame)
@@ -565,7 +640,7 @@ class SpeechTranslatorApp:
                 self.update_status("XTTS model loaded successfully. Starting TTS worker...")
 
                 if self.tts_worker is None or not self.tts_worker.is_alive():
-                    self.tts_worker = TTSWorker(self.tts_queue, self.status_queue, self.speaker_combo.current())
+                    self.tts_worker = TTSWorker(self.tts_queue, self.status_queue, self.tts_is_playing)
                     self.tts_worker.start()
 
         except Exception as e:
@@ -608,7 +683,7 @@ class SpeechTranslatorApp:
         self.live_text.config(state=tk.NORMAL)
         self.live_text.delete('1.0', tk.END)
         self.live_text.config(state=tk.DISABLED)
-        self.confirmed_text.delete('1.g', tk.END)
+        self.confirmed_text.delete('1.0', tk.END)
 
     def toggle_single_shot(self):
         if self.is_streaming:
@@ -625,8 +700,8 @@ class SpeechTranslatorApp:
             self.is_recording = True
             self.record_btn.config(text="Stop Recording")
             self.asr_worker = ASRWorker(
-                'single_shot', self.mic_combo.current(), self.vad_var.get(),
-                self.result_queue, self.status_queue
+                'single_shot', self.mic_combo.current(), self.vad_aggressiveness_var.get(),
+                self.result_queue, self.status_queue, self.tts_is_playing
             )
             self.asr_worker.start()
 
@@ -645,8 +720,8 @@ class SpeechTranslatorApp:
             self.is_streaming = True
             self.stream_btn.config(text="Stop Streaming")
             self.asr_worker = ASRWorker(
-                'streaming', self.mic_combo.current(), self.vad_var.get(),
-                self.result_queue, self.status_queue
+                'streaming', self.mic_combo.current(), self.vad_aggressiveness_var.get(),
+                self.result_queue, self.status_queue, self.tts_is_playing
             )
             self.asr_worker.start()
 
