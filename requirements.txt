@@ -19,5 +19,4 @@ llvmlite==0.43.0
 sounddevice==0.5.2
 soundfile==0.13.1
 requests==2.32.3
-simpleaudio==1.0.4
 webrtcvad-wheels==2.0.10.post2

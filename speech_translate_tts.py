@@ -166,15 +166,25 @@ def pull_ollama_model(model_name, app_instance):
         return False
 
 def get_audio_devices():
-    """Returns lists of input and output audio devices."""
+    """Returns a unified list of all audio devices, marking them as [IN] or [OUT]."""
+    devices = []
     try:
-        devices = sd.query_devices()
-        input_devices = [dev['name'] for dev in devices if dev['max_input_channels'] > 0]
-        output_devices = [dev['name'] for dev in devices if dev['max_output_channels'] > 0]
-        return input_devices, output_devices
+        for i, dev in enumerate(sd.query_devices()):
+            name = dev.get('name', f'Device {i}')
+            # A device can be both input and output
+            prefixes = []
+            if dev.get('max_input_channels', 0) > 0:
+                prefixes.append("IN")
+            if dev.get('max_output_channels', 0) > 0:
+                prefixes.append("OUT")
+
+            if prefixes:
+                devices.append(f"[{'/'.join(prefixes)}] {name}")
+            else:
+                devices.append(f"[?] {name}") # Unknown device type
     except Exception as e:
         logging.error(f"Could not query audio devices: {e}")
-        return [], []
+    return devices
 
 def longest_common_prefix(s1, s2):
     """Finds the longest common prefix string between two strings."""
@@ -339,12 +349,33 @@ class ASRWorker(threading.Thread):
 
 
 class TTSWorker(threading.Thread):
-    def __init__(self, task_queue, status_queue, tts_event):
+    def __init__(self, task_queue, status_queue, tts_event, get_selected_device_names_func, get_all_devices_func, virtual_mic_var):
         super().__init__(daemon=True)
         self.task_queue = task_queue
         self.status_queue = status_queue
         self.tts_event = tts_event
-        self.temp_audio_file = Path("_temp_tts.wav")
+        self.get_selected_device_names_func = get_selected_device_names_func
+        self.get_all_devices_func = get_all_devices_func
+        self.virtual_mic_var = virtual_mic_var
+
+    def _play_on_device(self, wav_data, device_idx):
+        try:
+            device_info = sd.query_devices(device_idx) # Query without kind to be safe
+            device_channels = device_info.get('max_output_channels', 0)
+
+            if device_channels == 0:
+                logging.warning(f"Device '{device_info['name']}' has no output channels. Skipping playback.")
+                return
+
+            playback_data = wav_data
+            if wav_data.ndim == 1 and device_channels > 1:
+                logging.info(f"Device '{device_info['name']}' expects >1 channels, converting mono to stereo.")
+                playback_data = np.stack((wav_data, wav_data), axis=-1)
+
+            sd.play(playback_data, samplerate=tts_model.synthesizer.output_sample_rate, device=device_idx)
+            sd.wait()
+        except Exception as e:
+            logging.error(f"Failed to play on device {device_idx}: {e}", exc_info=True)
 
     def run(self):
         global tts_model
@@ -357,50 +388,68 @@ class TTSWorker(threading.Thread):
                 task = self.task_queue.get(block=True)
                 text, lang, speaker_wav = task['text'], task['lang'], task['speaker_wav']
 
-                if not text:
+                selected_device_names = self.get_selected_device_names_func()
+                if not text or not selected_device_names:
+                    if not selected_device_names: logging.warning("TTS task skipped: No output devices selected.")
+                    self.task_queue.task_done()
+                    continue
+
+                all_devices_list = self.get_all_devices_func()
+
+                # Get indices from user's manual selection
+                device_indices_to_play = set()
+                for name in selected_device_names:
+                    try:
+                        device_indices_to_play.add(all_devices_list.index(name))
+                    except ValueError:
+                        logging.warning(f"Could not find index for selected device '{name}'. Skipping.")
+
+                # Add virtual mic if the checkbox is ticked
+                if self.virtual_mic_var.get():
+                    found_virtual_mic = False
+                    for i, device_name in enumerate(all_devices_list):
+                        if "Speech-Translate-TTS" in device_name:
+                            logging.info(f"Found virtual mic '{device_name}'. Adding to output devices.")
+                            device_indices_to_play.add(i)
+                            found_virtual_mic = True
+                            break # Assume only one
+                    if not found_virtual_mic:
+                        logging.warning("Virtual mic option was ticked, but no device containing 'Speech-Translate-TTS' was found.")
+
+                if not device_indices_to_play:
+                    logging.warning("TTS task skipped: Could not resolve any selected devices to an index.")
+                    self.task_queue.task_done()
                     continue
 
                 self.status_queue.put(f"Synthesizing speech for: '{text[:30]}...'")
                 logging.info(f"Starting TTS synthesis for text: '{text}'")
 
-                # Synthesize audio
-                tts_args = {
-                    "text": text,
-                    "language": lang,
-                    "split_sentences": True,
-                }
+                tts_args = {"text": text, "language": lang, "split_sentences": True}
                 if speaker_wav and Path(speaker_wav).exists():
                     tts_args["speaker_wav"] = speaker_wav
                 else:
-                    # If no speaker wav is provided, use the first available default speaker
-                    if tts_model.speakers:
-                        tts_args["speaker"] = tts_model.speakers[0]
-                        logging.info(f"No speaker_wav provided, using default speaker: {tts_args['speaker']}")
+                    if tts_model.speakers: tts_args["speaker"] = tts_model.speakers[0]
                     else:
-                        logging.error("No speaker_wav provided and no default speakers available in the model.")
+                        logging.error("TTS Error: No speaker_wav and no default speakers available.")
                         self.task_queue.task_done()
                         continue
 
-                wav = tts_model.tts(**tts_args)
+                wav = np.array(tts_model.tts(**tts_args))
 
-                # Write to a temporary WAV file
-                sf.write(
-                    self.temp_audio_file,
-                    np.array(wav),
-                    tts_model.synthesizer.output_sample_rate
-                )
-                logging.info(f"TTS audio saved to temporary file: {self.temp_audio_file}")
-
-                # Play audio using simpleaudio from the temporary file
+                playback_threads = []
                 try:
                     self.tts_event.set()
-                    logging.info("Playback started, ASR is paused.")
-                    wave_obj = sa.WaveObject.from_wave_file(str(self.temp_audio_file))
-                    play_obj = wave_obj.play()
-                    play_obj.wait_done()
+                    logging.info(f"Starting playback on {len(device_indices_to_play)} device(s), ASR is paused.")
+                    for dev_idx in device_indices_to_play:
+                        thread = threading.Thread(target=self._play_on_device, args=(wav, dev_idx))
+                        playback_threads.append(thread)
+                        thread.start()
+
+                    for thread in playback_threads:
+                        thread.join()
                 finally:
                     self.tts_event.clear()
-                    logging.info("Playback finished, ASR can resume.")
+                    logging.info("All playback finished, ASR can resume.")
 
                 self.status_queue.put("Speech synthesis finished.")
                 self.task_queue.task_done()
@@ -445,10 +494,11 @@ class SpeechTranslatorApp:
         self.target_lang_var = tk.StringVar(value="en")
         self.ollama_model_var = tk.StringVar(value=DEFAULT_OLLAMA_MODEL)
         self.mic_var = tk.StringVar()
-        self.speaker_var = tk.StringVar()
+        # self.speaker_var is no longer needed, will use listbox selection
         self.vad_aggressiveness_var = tk.IntVar(value=1)
         self.auto_speak_var = tk.BooleanVar(value=True)
         self.auto_save_var = tk.BooleanVar(value=False)
+        self.virtual_mic_var = tk.BooleanVar(value=False)
         self.speaker_wav_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Welcome! Load models to begin.")
 
@@ -477,12 +527,18 @@ class SpeechTranslatorApp:
         self.xtts_status.grid(row=1, column=1, sticky=tk.W)
 
         ttk.Label(models_frame, text="Mic:").grid(row=0, column=2, padx=5, sticky=tk.E)
-        self.mic_combo = ttk.Combobox(models_frame, textvariable=self.mic_var, state="readonly")
+        self.mic_combo = ttk.Combobox(models_frame, textvariable=self.mic_var, state="readonly", width=60)
         self.mic_combo.grid(row=0, column=3, sticky=(tk.W, tk.E))
 
-        ttk.Label(models_frame, text="Speaker:").grid(row=1, column=2, padx=5, sticky=tk.E)
-        self.speaker_combo = ttk.Combobox(models_frame, textvariable=self.speaker_var, state="readonly")
-        self.speaker_combo.grid(row=1, column=3, sticky=(tk.W, tk.E))
+        ttk.Label(models_frame, text="Output Devices (Ctrl+Click):").grid(row=1, column=2, padx=5, sticky=tk.E)
+
+        speaker_frame = ttk.Frame(models_frame)
+        speaker_frame.grid(row=1, column=3, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.speaker_listbox = tk.Listbox(speaker_frame, selectmode=tk.EXTENDED, height=8, width=60)
+        self.speaker_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        speaker_scrollbar = ttk.Scrollbar(speaker_frame, orient=tk.VERTICAL, command=self.speaker_listbox.yview)
+        speaker_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.speaker_listbox.config(yscrollcommand=speaker_scrollbar.set)
 
         ttk.Button(models_frame, text="Refresh Devices", command=self.update_audio_devices).grid(row=0, column=4, rowspan=2, padx=5)
 
@@ -517,12 +573,13 @@ class SpeechTranslatorApp:
 
         ttk.Checkbutton(options_frame, text="Auto-speak Translation", variable=self.auto_speak_var).grid(row=0, column=0, columnspan=2, sticky=tk.W)
         ttk.Checkbutton(options_frame, text="Auto-save Transcript", variable=self.auto_save_var).grid(row=1, column=0, columnspan=2, sticky=tk.W)
+        ttk.Checkbutton(options_frame, text="Output to 'Speech-Translate-TTS' virt. mic", variable=self.virtual_mic_var).grid(row=2, column=0, columnspan=2, sticky=tk.W)
 
-        ttk.Label(options_frame, text="VAD Aggressiveness:").grid(row=2, column=0, sticky=tk.W, pady=(5,0))
-        ttk.Combobox(options_frame, textvariable=self.vad_aggressiveness_var, values=[0, 1, 2, 3], width=5, state="readonly").grid(row=2, column=1, sticky=tk.W, pady=(5,0))
+        ttk.Label(options_frame, text="VAD Aggressiveness:").grid(row=3, column=0, sticky=tk.W, pady=(5,0))
+        ttk.Combobox(options_frame, textvariable=self.vad_aggressiveness_var, values=[0, 1, 2, 3], width=5, state="readonly").grid(row=3, column=1, sticky=tk.W, pady=(5,0))
 
         speaker_wav_frame = ttk.Frame(options_frame)
-        speaker_wav_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        speaker_wav_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         speaker_wav_frame.columnconfigure(1, weight=1)
         ttk.Button(speaker_wav_frame, text="Speaker WAV...", command=self.select_speaker_wav).grid(row=0, column=0)
         ttk.Entry(speaker_wav_frame, textvariable=self.speaker_wav_var, state="readonly").grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
@@ -646,7 +703,8 @@ class SpeechTranslatorApp:
                 self.update_status("XTTS model loaded successfully. Starting TTS worker...")
 
                 if self.tts_worker is None or not self.tts_worker.is_alive():
-                    self.tts_worker = TTSWorker(self.tts_queue, self.status_queue, self.tts_is_playing)
+                    # Pass a function to get selected names, and a function to get the master list of all device names
+                    self.tts_worker = TTSWorker(self.tts_queue, self.status_queue, self.tts_is_playing, self.get_selected_speaker_names, lambda: self.all_devices, self.virtual_mic_var)
                     self.tts_worker.start()
 
         except Exception as e:
@@ -668,14 +726,42 @@ class SpeechTranslatorApp:
         threading.Thread(target=self._load_model_thread, args=('tts',), daemon=True).start()
 
     def update_audio_devices(self):
-        self.input_devices, self.output_devices = get_audio_devices()
-        self.mic_combo['values'] = self.input_devices
-        if self.input_devices:
+        self.all_devices = get_audio_devices()
+
+        # Populate mic combobox with only input devices
+        input_devices = [dev for dev in self.all_devices if "[IN]" in dev]
+        self.mic_combo['values'] = input_devices
+        if input_devices:
             self.mic_combo.current(0)
-        self.speaker_combo['values'] = self.output_devices
-        if self.output_devices:
-            self.speaker_combo.current(0)
+
+        # Populate speaker listbox with all devices
+        self.speaker_listbox.delete(0, tk.END)
+        for device_name in self.all_devices:
+            self.speaker_listbox.insert(tk.END, device_name)
+            # Pre-select the default output device
+            try:
+                default_out_idx = sd.default.device[1]
+                if default_out_idx != -1 and self.all_devices[default_out_idx] == device_name:
+                    self.speaker_listbox.selection_set(self.speaker_listbox.size() - 1)
+            except Exception:
+                pass # Ignore errors in finding default
+
         self.update_status("Audio devices updated.")
+
+    def get_selected_speaker_names(self):
+        """Gets the names of the selected items in the speaker listbox."""
+        selected_indices = self.speaker_listbox.curselection()
+        return [self.speaker_listbox.get(i) for i in selected_indices]
+
+    def get_selected_mic_index(self):
+        """Gets the global device index for the selected microphone."""
+        try:
+            selected_mic_name = self.mic_var.get()
+            return self.all_devices.index(selected_mic_name)
+        except (ValueError, AttributeError):
+            # Fallback to the first device if something goes wrong
+            logging.warning(f"Could not find selected mic '{self.mic_var.get()}'. Defaulting to device 0.")
+            return 0
 
     def select_speaker_wav(self):
         filepath = filedialog.askopenfilename(
@@ -706,7 +792,7 @@ class SpeechTranslatorApp:
             self.is_recording = True
             self.record_btn.config(text="Stop Recording")
             self.asr_worker = ASRWorker(
-                'single_shot', self.mic_combo.current(), self.vad_aggressiveness_var.get(),
+                'single_shot', self.get_selected_mic_index(), self.vad_aggressiveness_var.get(),
                 self.result_queue, self.status_queue, self.tts_is_playing
             )
             self.asr_worker.start()
@@ -726,7 +812,7 @@ class SpeechTranslatorApp:
             self.is_streaming = True
             self.stream_btn.config(text="Stop Streaming")
             self.asr_worker = ASRWorker(
-                'streaming', self.mic_combo.current(), self.vad_aggressiveness_var.get(),
+                'streaming', self.get_selected_mic_index(), self.vad_aggressiveness_var.get(),
                 self.result_queue, self.status_queue, self.tts_is_playing
             )
             self.asr_worker.start()
