@@ -2,9 +2,6 @@
 
 This project is an offline-first, real-time speech translation GUI for Windows. It captures audio from a microphone, transcribes it to text, translates the text, and synthesizes it back to speech, all locally on your machine.
 
-![Application Screenshot](https://i.imgur.com/your-screenshot.png)
-*(Note: You can replace the link above with a real screenshot of the application)*
-
 ---
 
 ## Features
@@ -54,7 +51,7 @@ Follow these steps to get the application running. The setup script will handle 
 2.  **Prepare Ollama Model**
     Open a terminal or PowerShell and pull the required translation model:
     ```bash
-    ollama pull gemma:3b
+    ollama pull gemma3:1b
     ```
 
 3.  **Run the Setup Script**
